@@ -7,44 +7,47 @@ import pandas as pd
 import psutil
 import tenseal as ts
 
-CATEGORY_DOMAINS = {
-    "INCOME_BRACKET": [0, 1],          # 0: <= $50k, 1: > $50k
-    "SCHL": list(range(0, 25)),        # educational attainment
-    "RAC1P": list(range(1, 10)),       # race
-    "SEX": [1, 2],                     # sex
-    "COW": list(range(0, 10)),         # class of worker
-    "MAR": list(range(1, 6)),          # marital status
-}
-GROUP_VARS = ["INCOME_BRACKET", "SCHL", "RAC1P", "SEX", "COW"]
-MEAN_TARGETS = ["PINCP", "AGEP", "WKHP"]
+# import manual configurations 
+import config as config
 
 
 def _indicator(var, level):
     return f"{var}={level}"
 
 def prepare(df):
+    ## TODO: should we consider makeing the variables flexible so that it
+    ## can work with other datasets as well?
+    # Or this should be moved to the ingestor 
     out = df[["AGEP", "WKHP", "PINCP", "SCHL", "RAC1P", "SEX", "COW", "MAR"]].copy()
     out["INCOME_BRACKET"] = (df["PINCP"] > 50_000).astype(int)
-    for var in CATEGORY_DOMAINS:
+    for var in config.CATEGORY_DOMAINS:
         out[var] = out[var].astype(int)
     return out.reset_index(drop=True)
 
 
-def features_plain(df):
+def features_plain(df, mean_targets=config.MEAN_TARGETS, 
+                   group_vars=config.GROUP_VARS, 
+                   category_domains=config.CATEGORY_DOMAINS):
+    """
+    Creates features on the unencrypted dataset
+
+    ## TODO: we should work to make this more flexible so that it could be expansively 
+    ## applied to other featues rather than just the ones we've pre-defined
+    """
     df = prepare(df)
     rows = []
     n = len(df)
-    for target in MEAN_TARGETS:
+    for target in mean_targets:
         rows.append(("mean", target, "ALL", "ALL", df[target].mean()))
-    for var in GROUP_VARS:
-        for level in CATEGORY_DOMAINS[var]:
+    for var in group_vars:
+        for level in category_domains[var]:
             mask = df[var] == level
             rows.append(("count", "n", var, level, float(mask.sum())))
-            for target in MEAN_TARGETS:
+            for target in mean_targets:
                 value = df.loc[mask, target].mean() if mask.any() else np.nan
                 rows.append(("mean", target, var, level, value))
     rows.append(("corr", "AGEP~PINCP", "ALL", "ALL", df["AGEP"].corr(df["PINCP"])))
-    for level in CATEGORY_DOMAINS["MAR"]:
+    for level in category_domains["MAR"]:
         indicator = (df["MAR"] == level).astype(float)
         value = df["WKHP"].corr(indicator) if 0 < indicator.sum() < n else np.nan
         rows.append(("corr", "WKHP~MAR", "MAR", level, value))
@@ -52,8 +55,17 @@ def features_plain(df):
 
 
 class DataOwner:
+    """
+    Class represeting the data owner.
+    
+    Includes methods:
+        public_context: 
+        encode:
+        encrypt: perform homomorphic encryption
+
+    """
     def __init__(self, poly_modulus_degree=8192, coeff_mod_bit_sizes=(60, 40, 40, 60),
-                 global_scale=2 ** 40):
+                 global_scale=2 ** 40, mean_targets= config.MEAN_TARGETS, category_domains=config.CATEGORY_DOMAINS):
         self.context = ts.context(
             ts.SCHEME_TYPE.CKKS,
             poly_modulus_degree=poly_modulus_degree,
@@ -63,19 +75,29 @@ class DataOwner:
         # Galois keys are needed for rotations in .sum() / .dot().
         self.context.generate_galois_keys()
         self.slots = poly_modulus_degree // 2
+        self.mean_targets = mean_targets ## TODO: consider changing this depending on how we make the functions more flexible
+        self.category_domains = category_domains ## TODO: same with this
 
     def public_context(self):
         return self.context.serialize(save_secret_key=False)
 
     def encode(self, df):
+        """
+        prepares for encryption by converting: 
+            - MEAN_TARGETS columns to floats and 
+            - CATEGORY_DOMAINS to one-hot encoded variables
+        """
         df = prepare(df)
-        columns = {target: df[target].astype(float).to_numpy() for target in MEAN_TARGETS}
-        for var, levels in CATEGORY_DOMAINS.items():
+        columns = {target: df[target].astype(float).to_numpy() for target in self.mean_targets}
+        for var, levels in self.category_domains.items():
             for level in levels:
                 columns[_indicator(var, level)] = (df[var] == level).astype(float).to_numpy()
         return pd.DataFrame(columns)
 
     def encrypt(self, encoded):
+        """
+        Encrypt the encoded values
+        """
         n = len(encoded)
         package = {"n_rows": n, "columns": {}}
         for name in encoded.columns:
@@ -87,6 +109,9 @@ class DataOwner:
         return package
 
     def decrypt(self, encrypted_stats):
+        """
+        Decrypt the returned values
+        """
         return {
             key: ts.ckks_vector_from(self.context, blob).decrypt()[0]
             for key, blob in encrypted_stats.items()
@@ -95,16 +120,16 @@ class DataOwner:
     @staticmethod
     def finalize(stats, n):
         rows = []
-        for target in MEAN_TARGETS:
+        for target in config.MEAN_TARGETS:
             rows.append(("mean", target, "ALL", "ALL", stats[f"sum[{target}]"] / n))
-        for var in GROUP_VARS:
-            for level in CATEGORY_DOMAINS[var]:
+        for var in config.GROUP_VARS:
+            for level in config.CATEGORY_DOMAINS[var]:
                 ind = _indicator(var, level)
                 count = stats[f"sum[{ind}]"]
                 # CKKS is approximate: a count of 0 decrypts to ~1e-6, not 0.
                 empty = round(count) == 0
                 rows.append(("count", "n", var, level, count))
-                for target in MEAN_TARGETS:
+                for target in config.MEAN_TARGETS:
                     value = np.nan if empty else stats[f"dot[{target},{ind}]"] / count
                     rows.append(("mean", target, var, level, value))
 
@@ -117,7 +142,7 @@ class DataOwner:
             stats["sum[AGEP]"], stats["sum[PINCP]"],
             stats["dot[AGEP,AGEP]"], stats["dot[PINCP,PINCP]"], stats["dot[AGEP,PINCP]"],
         )))
-        for level in CATEGORY_DOMAINS["MAR"]:
+        for level in config.CATEGORY_DOMAINS["MAR"]:
             ind = _indicator("MAR", level)
             s_ind = stats[f"sum[{ind}]"]
             # indicator^2 == indicator, so sum(ind^2) = sum(ind).
@@ -155,20 +180,22 @@ class UntrustedResearcher:
         return total
 
     def required_statistics(self):
-        sums = list(MEAN_TARGETS)
+        sums = list(config.MEAN_TARGETS)
         dots = [("AGEP", "AGEP"), ("PINCP", "PINCP"), ("AGEP", "PINCP"), ("WKHP", "WKHP")]
-        for var in GROUP_VARS:
-            for level in CATEGORY_DOMAINS[var]:
+        for var in config.GROUP_VARS:
+            for level in config.CATEGORY_DOMAINS[var]:
                 ind = _indicator(var, level)
                 sums.append(ind)
-                dots += [(target, ind) for target in MEAN_TARGETS]
-        for level in CATEGORY_DOMAINS["MAR"]:
+                dots += [(target, ind) for target in config.MEAN_TARGETS]
+        for level in config.CATEGORY_DOMAINS["MAR"]:
             ind = _indicator("MAR", level)
             sums.append(ind)
             dots.append(("WKHP", ind))
         return sums, list(dict.fromkeys(dots))
 
     def compute(self, package):
+        ## TODO: edit this to be able to take in a method, rather than
+        ## calculating just the statstics we defined
         cols = self._load(package)
         sums, dots = self.required_statistics()
         out = {}
@@ -179,14 +206,23 @@ class UntrustedResearcher:
         return out
 
 class Measure:
-    def __init__(self, interval=0.005):
+    """
+    Measure execution time and memory for 
+    one pipline stage
+    """
+    def __init__(self, stage="undefined", interval=0.005):
+        self.stage = stage
         self.interval = interval
         self.process = psutil.Process(os.getpid())
 
     def _sample(self):
         while not self._stop.is_set():
-            self.peak_rss = max(self.peak_rss, self.process.memory_info().rss)
-            self._stop.wait(self.interval)
+            try:
+                self.peak_rss = max(self.peak_rss, self.process.memory_info().rss)
+                self._stop.wait(self.interval)
+            except psutil.Error as e:
+                print(f'Error Occurred: {e}')
+                continue
 
     def __enter__(self):
         self.base_rss = self.peak_rss = self.process.memory_info().rss
@@ -202,13 +238,19 @@ class Measure:
         self._thread.join()
         self.peak_rss = max(self.peak_rss, self.process.memory_info().rss)
 
+    def measure_size(self, obj):
+        self.size_bytes = len(obj)
+        return self.size_bytes
+
     def summary(self):
-        return {
+        result = {
             "latency_s": self.seconds,
             "peak_rss_mib": self.peak_rss / 2 ** 20,
             "peak_rss_increase_mib": (self.peak_rss - self.base_rss) / 2 ** 20,
         }
-
+        if hasattr(self, "size_bytes"):
+            result["size_bytes"] = self.size_bytes
+        return {self.stage: result}
 
 def package_nbytes(package):
     return sum(len(blob) for chunks in package["columns"].values() for blob in chunks)
