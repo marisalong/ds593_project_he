@@ -9,8 +9,38 @@ from pathlib import Path
 import pandas as pd
 from folktables import ACSDataSource
 
+def preprocess():
+    """
+    Preprocess by dropping columns with missing values and removing columns not used in aggregation
+    """
 
-def download_and_clean_ascincome(states, year, horizon, features, min_age, info=True):
+def clean_rows(data, features, min_age=0):
+    """
+    """
+    # ensure that all values are numeric
+    for column in features:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    # drop rows where personal income missing
+    data = data.dropna(subset=['PINCP']).copy()
+
+    # Optional population restriction
+    if min_age > 0:
+        data = data[data["AGEP"] >= min_age].copy()
+    return data
+
+def create_weighted_columns(data, features):
+    """
+    Create weighted columns
+    """
+    for column in set(features) - {"PWGTP", "PINCP"}:
+        data[f"{column}_weighted_sum"] = (
+            data[column].fillna(0) * data["PWGTP"]
+        ).astype("int64")
+        data[f"{column}_weight"] = data["PWGTP"].where(data[column].notna(), 0).astype("int64")
+    return data
+
+def download_and_clean_ascincome(states, year, horizon, features, min_age, weighted_columns=True, download=False, info=True):
     """
     Download and clean the ASC Income Dataset
     """
@@ -20,7 +50,7 @@ def download_and_clean_ascincome(states, year, horizon, features, min_age, info=
         horizon=horizon,
         survey="person",
     )
-    raw = source.get_data(states=states, download=True)
+    raw = source.get_data(states=states, download=download)
 
     if features == "all":
         features = ["AGEP","COW","SCHL","MAR","POBP","RELP","WKHP", "OCCP","SEX","RAC1P","PINCP","PWGTP"]
@@ -29,39 +59,32 @@ def download_and_clean_ascincome(states, year, horizon, features, min_age, info=
     if missing_columns:
         raise ValueError(f"Downloaded data is missing expected columns: {missing_columns}")
 
-    # Convert relevant columns to numeric. Non-numeric or missing values become NaN.
     data = raw[features].copy()
-    for column in features:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
-
     rows_before = len(data)
+    data = clean_rows(data, features, min_age)
 
-    # A target cannot be created when personal income is missing.
-    data = data.dropna(subset=['PINCP']).copy()
-
-    # Optional population restriction. This is explicit so you can change it.
-    if min_age > 0:
-        data = data[data["AGEP"] >= min_age].copy()
-
-    # Create the binary ACSIncome label.
+    # create target (50k)
     data["income_over_50k"] = (data["PINCP"] > 50_000).astype("int8")
 
-    # Create weight columns
+    if weighted_columns:
+        data = create_weighted_columns(data, features)
+
     for column in set(features) - {"PWGTP", "PINCP"}:
         data[f"{column}_weighted_sum"] = (
             data[column].fillna(0) * data["PWGTP"]
         ).astype("int64")
         data[f"{column}_weight"] = data["PWGTP"].where(data[column].notna(), 0).astype("int64")
 
-    # Preserve feature missingness explicitly. Fill missing feature values with 0
-    # only after adding a separate missingness indicator.
+    # Add column for missing data
     for column in features:
         data[f"{column}_missing"] = data[column].isna().astype("int8")
         data[column] = data[column].fillna(0)
 
-    output_columns = features + [f"{c}_missing" for c in features] + [
-        "income_over_50k"
-    ]
+    output_columns = features + ["income_over_50k"] + [f"{c}_missing" for c in features]
+    if weighted_columns:
+        output_columns = output_columns + [f"{c}_weighted_sum" for c in features] + [
+            f"{c}_weight" for c in features]
+    
     cleaned = data[output_columns].reset_index(drop=True)
 
     if info:
